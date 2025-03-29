@@ -1,0 +1,581 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts@4.8.3/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts@4.8.3/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts@4.8.3/access/Ownable.sol";
+import "@openzeppelin/contracts@4.8.3/security/ReentrancyGuard.sol";
+import "@openzeppelin/contracts@4.8.3/utils/math/SafeMath.sol";
+
+/**
+ * @title PLSXSSS
+ * @dev Self-sustainable single-sided PLSX staking contract with dynamic rewards
+ */
+contract PLSXSSS is Ownable, ReentrancyGuard {
+    using SafeERC20 for IERC20;
+    using SafeMath for uint256;
+
+    // The PLSX token contract
+    IERC20 public plsxToken;
+    
+    // Reward rate - tokens distributed per second
+    uint256 public rewardRate;
+    
+    // Last time rewards were updated
+    uint256 public lastUpdateTime;
+    
+    // Reward per token stored
+    uint256 public rewardPerTokenStored;
+    
+    // Total staked tokens
+    uint256 public totalStaked;
+    
+    // Minimum stake amount
+    uint256 public minimumStake;
+    
+    // Maximum APR (annual percentage rate) as basis points (1% = 100)
+    uint256 public maxAPR;
+    
+    // Target sustainability period in days (for dynamic rate adjustment)
+    uint256 public targetSustainabilityDays;
+    
+    // Last time reward rate was dynamically adjusted
+    uint256 public lastRateAdjustmentTime;
+    
+    // Rate adjustment period (7 days by default)
+    uint256 public rateAdjustmentPeriod;
+    
+    // Minimum reward rate
+    uint256 public minRewardRate;
+    
+    // Withdrawal fee tiers based on staking duration (in basis points)
+    uint256 public constant FEE_TIER_1 = 500; // 5.0% if withdrawn within 7 days
+    uint256 public constant FEE_TIER_2 = 350; // 3.5% if withdrawn between 7-14 days
+    uint256 public constant FEE_TIER_3 = 200; // 2.0% if withdrawn between 14-30 days
+    uint256 public constant FEE_TIER_4 = 100;  // 1.0% if withdrawn after 30+ days
+    
+    // Time thresholds for fee tiers (in seconds)
+    uint256 public constant TIER_1_THRESHOLD = 7 days;
+    uint256 public constant TIER_2_THRESHOLD = 14 days;
+    uint256 public constant TIER_3_THRESHOLD = 30 days;
+    
+    // Fee distribution ratio (in basis points)
+    uint256 public constant REWARD_POOL_RATIO = 70; // 70% of the fee goes to the reward pool (0.7% of stake/unstake)
+    uint256 public constant DEV_WALLET_RATIO = 30;  // 30% of the fee goes to the dev wallet (0.3% of stake/unstake)
+    uint256 public constant RATIO_DENOMINATOR = 100; // Ratio denominator
+    
+    // For fee calculations
+    uint256 public constant FEE_DENOMINATOR = 10000; // Fee basis points denominator
+    
+    // Staking fee (fixed at 1%)
+    uint256 public constant STAKING_FEE = 100; // 1%
+    
+    // Dev wallet address
+    address public constant DEV_WALLET = 0x5D4ec8b4f491f8Ca6cC2800a995A27E28ea561A8;
+    
+    // User rewards per token paid
+    mapping(address => uint256) public userRewardPerTokenPaid;
+    
+    // Accumulated rewards for user
+    mapping(address => uint256) public rewards;
+    
+    // User staking balances
+    mapping(address => uint256) public balances;
+    
+    // Average stake time weighted by amount (in seconds since epoch)
+    mapping(address => uint256) public weightedStakeTime;
+    
+    // Total fees collected
+    uint256 public totalFeesCollected;
+    
+    // Total rewards distributed
+    uint256 public totalRewardsDistributed;
+
+    // Events
+    event Staked(address indexed user, uint256 amount, uint256 fee);
+    event Withdrawn(address indexed user, uint256 amount, uint256 fee);
+    event RewardPaid(address indexed user, uint256 reward);
+    event FeeDistributed(uint256 totalFee, uint256 rewardPoolFee, uint256 devWalletFee);
+    event RewardRateAdjusted(uint256 oldRate, uint256 newRate, string reason);
+    event TargetSustainabilityUpdated(uint256 newTargetDays);
+    event StakeDurationFeeApplied(address indexed user, uint256 stakeDuration, uint256 feePercentage);
+
+    /**
+     * @dev Constructor
+     * @param _plsxToken Address of the PLSX token
+     */
+    constructor(address _plsxToken) Ownable() ReentrancyGuard() {
+        require(_plsxToken != address(0), "Invalid token address");
+        plsxToken = IERC20(_plsxToken);
+        rewardRate = 1000000000000; // Initial reward rate (0.000001 PLSX per second)
+        minimumStake = 1000000000000000; // 0.001 PLSX minimum stake
+        maxAPR = 2800; // 28%
+        lastUpdateTime = block.timestamp;
+        
+        // Sustainability settings
+        targetSustainabilityDays = 90; // 90 days target sustainability period
+        lastRateAdjustmentTime = block.timestamp;
+        rateAdjustmentPeriod = 7 days; // Weekly adjustments
+        minRewardRate = 100000000; // Minimum reward rate floor
+    }
+
+    /**
+     * @dev Returns the latest reward per token
+     * @return Calculated reward per token
+     */
+    function rewardPerToken() public view returns (uint256) {
+        if (totalStaked == 0) {
+            return rewardPerTokenStored;
+        }
+        
+        return rewardPerTokenStored.add(
+            block.timestamp.sub(lastUpdateTime).mul(rewardRate).mul(1e18).div(totalStaked)
+        );
+    }
+
+    /**
+     * @dev Returns the earned rewards for a user
+     * @param account User address
+     * @return Earned rewards
+     */
+    function earned(address account) public view returns (uint256) {
+        return balances[account].mul(
+            rewardPerToken().sub(userRewardPerTokenPaid[account])
+        ).div(1e18).add(rewards[account]);
+    }
+
+    /**
+     * @dev Calculate staking fee (fixed at 1%)
+     * @param amount Amount to stake
+     * @return totalFee, rewardPoolFee, devWalletFee
+     */
+    function calculateStakingFees(uint256 amount) public pure returns (uint256, uint256, uint256) {
+        uint256 totalFee = amount.mul(STAKING_FEE).div(FEE_DENOMINATOR);
+        uint256 rewardPoolFee = totalFee.mul(REWARD_POOL_RATIO).div(RATIO_DENOMINATOR);
+        uint256 devWalletFee = totalFee.mul(DEV_WALLET_RATIO).div(RATIO_DENOMINATOR);
+        
+        return (totalFee, rewardPoolFee, devWalletFee);
+    }
+
+    /**
+     * @dev Calculate unstaking fee based on staking duration
+     * @param account User address
+     * @param amount Amount to unstake
+     * @return totalFee, rewardPoolFee, devWalletFee
+     */
+    function calculateUnstakingFees(address account, uint256 amount) public view returns (uint256, uint256, uint256) {
+        // Calculate staking duration using weighted average time
+        uint256 stakeDuration = block.timestamp.sub(weightedStakeTime[account]);
+        
+        // Determine fee tier based on duration
+        uint256 feeTier;
+        if (stakeDuration < TIER_1_THRESHOLD) {
+            feeTier = FEE_TIER_1; // 5.0%
+        } else if (stakeDuration < TIER_2_THRESHOLD) {
+            feeTier = FEE_TIER_2; // 3.5%
+        } else if (stakeDuration < TIER_3_THRESHOLD) {
+            feeTier = FEE_TIER_3; // 2.0%
+        } else {
+            feeTier = FEE_TIER_4; // 1.0%
+        }
+        
+        // Calculate fees
+        uint256 totalFee = amount.mul(feeTier).div(FEE_DENOMINATOR);
+        uint256 rewardPoolFee = totalFee.mul(REWARD_POOL_RATIO).div(RATIO_DENOMINATOR);
+        uint256 devWalletFee = totalFee.mul(DEV_WALLET_RATIO).div(RATIO_DENOMINATOR);
+        
+        return (totalFee, rewardPoolFee, devWalletFee);
+    }
+
+    /**
+     * @dev Get current APR in basis points
+     * @return Current Annual Percentage Rate
+     */
+    function getCurrentAPR() public view returns (uint256) {
+        if (totalStaked == 0) return 0;
+        
+        // Calculate annual rewards based on current rate
+        uint256 annualRewards = rewardRate.mul(365 days);
+        
+        // Calculate APR as basis points
+        uint256 apr = annualRewards.mul(10000).div(totalStaked);
+        
+        // Cap at maxAPR
+        return apr > maxAPR ? maxAPR : apr;
+    }
+
+    /**
+     * @dev Get remaining rewards in the contract
+     * @return Available rewards
+     */
+    function getAvailableRewards() public view returns (uint256) {
+        // Available rewards = contract balance - staked tokens
+        uint256 contractBalance = plsxToken.balanceOf(address(this));
+        return contractBalance > totalStaked ? contractBalance.sub(totalStaked) : 0;
+    }
+
+    /**
+     * @dev Calculate sustainability in days at current reward rate
+     * @return Days of sustainability
+     */
+    function getCurrentSustainabilityDays() public view returns (uint256) {
+        uint256 availableRewards = getAvailableRewards();
+        if (rewardRate == 0 || availableRewards == 0) return 0;
+        
+        // Calculate how many seconds the rewards will last
+        uint256 secondsRemaining = availableRewards.div(rewardRate);
+        
+        // Convert to days
+        return secondsRemaining.div(1 days);
+    }
+
+    /**
+     * @dev Check if reward rate adjustment is needed
+     * @return Whether adjustment is needed, recommended new rate
+     */
+    function checkRewardRateAdjustment() public view returns (bool, uint256) {
+        // Check if it's time for adjustment
+        bool timeForAdjustment = block.timestamp >= lastRateAdjustmentTime.add(rateAdjustmentPeriod);
+        
+        if (!timeForAdjustment) {
+            return (false, rewardRate);
+        }
+        
+        uint256 availableRewards = getAvailableRewards();
+        uint256 currentSustainabilityDays = getCurrentSustainabilityDays();
+        
+        // If we have no rewards or no staked tokens, set minimum rate
+        if (availableRewards == 0 || totalStaked == 0) {
+            return (true, minRewardRate);
+        }
+        
+        // Adjust rate based on current sustainability vs target
+        if (currentSustainabilityDays < targetSustainabilityDays.mul(90).div(100)) {
+            // Less than 90% of target - decrease rate by 10%
+            uint256 newRate = rewardRate.mul(90).div(100);
+            return (true, newRate > minRewardRate ? newRate : minRewardRate);
+        } else if (currentSustainabilityDays > targetSustainabilityDays.mul(150).div(100)) {
+            // More than 150% of target - increase rate by 10%
+            uint256 newRate = rewardRate.mul(110).div(100);
+            
+            // Check if new rate would exceed max APR
+            uint256 potentialAPR = newRate.mul(365 days).mul(10000).div(totalStaked);
+            if (potentialAPR > maxAPR) {
+                // Calculate rate that would hit exactly max APR
+                newRate = maxAPR.mul(totalStaked).div(10000).div(365 days);
+            }
+            
+            return (true, newRate);
+        }
+        
+        // Within acceptable range, no adjustment needed
+        return (true, rewardRate);
+    }
+
+    /**
+     * @dev Adjust reward rate if needed
+     */
+    function adjustRewardRate() public updateReward(address(0)) {
+        (bool shouldAdjust, uint256 newRate) = checkRewardRateAdjustment();
+        
+        if (shouldAdjust && newRate != rewardRate) {
+            string memory reason;
+            
+            if (newRate > rewardRate) {
+                reason = "Increasing rate - high sustainability";
+            } else if (newRate < rewardRate) {
+                reason = "Decreasing rate - low sustainability";
+            } else {
+                reason = "Rate unchanged";
+            }
+            
+            uint256 oldRate = rewardRate;
+            rewardRate = newRate;
+            lastRateAdjustmentTime = block.timestamp;
+            
+            emit RewardRateAdjusted(oldRate, newRate, reason);
+        }
+    }
+
+    /**
+     * @dev Updates reward calculations
+     * @param account User address
+     */
+    modifier updateReward(address account) {
+        rewardPerTokenStored = rewardPerToken();
+        lastUpdateTime = block.timestamp;
+        
+        if (account != address(0)) {
+            rewards[account] = earned(account);
+            userRewardPerTokenPaid[account] = rewardPerTokenStored;
+        }
+        
+        // Check if we should adjust the reward rate
+        if (block.timestamp >= lastRateAdjustmentTime.add(rateAdjustmentPeriod)) {
+            (bool shouldAdjust, ) = checkRewardRateAdjustment();
+            if (shouldAdjust) {
+                adjustRewardRate();
+            }
+        }
+        
+        _;
+    }
+
+    /**
+     * @dev Stakes tokens with improved timestamp handling
+     * @param amount Amount to stake
+     */
+    function stake(uint256 amount) external nonReentrant updateReward(msg.sender) {
+        require(amount >= minimumStake, "Cannot stake less than minimum");
+        
+        // Calculate and deduct fee
+        (uint256 totalFee, uint256 rewardPoolFee, uint256 devWalletFee) = calculateStakingFees(amount);
+        
+        // Amount after fee
+        uint256 stakeAmount = amount.sub(totalFee);
+        
+        // Update weighted stake time calculation
+        if (balances[msg.sender] > 0) {
+            // If user already has stakes, calculate weighted average time
+            weightedStakeTime[msg.sender] = (
+                weightedStakeTime[msg.sender].mul(balances[msg.sender]).add(
+                    block.timestamp.mul(stakeAmount)
+                )
+            ).div(balances[msg.sender].add(stakeAmount));
+        } else {
+            // First time staking
+            weightedStakeTime[msg.sender] = block.timestamp;
+        }
+        
+        // Update state
+        totalStaked = totalStaked.add(stakeAmount);
+        balances[msg.sender] = balances[msg.sender].add(stakeAmount);
+        
+        // Update fee statistics
+        totalFeesCollected = totalFeesCollected.add(totalFee);
+        
+        // Transfer tokens from user
+        plsxToken.safeTransferFrom(msg.sender, address(this), amount);
+        
+        // Transfer dev wallet portion
+        if (devWalletFee > 0) {
+            plsxToken.safeTransfer(DEV_WALLET, devWalletFee);
+        }
+        
+        emit Staked(msg.sender, stakeAmount, totalFee);
+        emit FeeDistributed(totalFee, rewardPoolFee, devWalletFee);
+    }
+
+    /**
+     * @dev Withdraws staked tokens - INSTANT WITHDRAWAL (no lock period)
+     * @param amount Amount to withdraw
+     */
+    function withdraw(uint256 amount) external nonReentrant updateReward(msg.sender) {
+        require(amount > 0, "Cannot withdraw 0");
+        require(balances[msg.sender] >= amount, "Not enough staked tokens");
+        
+        // Calculate time-based fee (higher for short-term stakers)
+        (uint256 totalFee, uint256 rewardPoolFee, uint256 devWalletFee) = calculateUnstakingFees(msg.sender, amount);
+        
+        // Amount after fee
+        uint256 withdrawAmount = amount.sub(totalFee);
+        
+        // Update state
+        totalStaked = totalStaked.sub(amount);
+        balances[msg.sender] = balances[msg.sender].sub(amount);
+        
+        // Update fee statistics
+        totalFeesCollected = totalFeesCollected.add(totalFee);
+        
+        // Calculate and log stake duration for analytics
+        uint256 stakeDuration = block.timestamp.sub(weightedStakeTime[msg.sender]);
+        
+        // Transfer tokens to user (after fee)
+        plsxToken.safeTransfer(msg.sender, withdrawAmount);
+        
+        // Transfer dev wallet portion
+        if (devWalletFee > 0) {
+            plsxToken.safeTransfer(DEV_WALLET, devWalletFee);
+        }
+        
+        // Log stake duration and fee tier applied
+        uint256 feePercentage = totalFee.mul(10000).div(amount);
+        emit StakeDurationFeeApplied(msg.sender, stakeDuration, feePercentage);
+        emit Withdrawn(msg.sender, withdrawAmount, totalFee);
+        emit FeeDistributed(totalFee, rewardPoolFee, devWalletFee);
+    }
+
+    /**
+     * @dev Claims rewards
+     */
+    function getReward() external nonReentrant updateReward(msg.sender) {
+        uint256 reward = rewards[msg.sender];
+        if (reward > 0) {
+            rewards[msg.sender] = 0;
+            totalRewardsDistributed = totalRewardsDistributed.add(reward);
+            plsxToken.safeTransfer(msg.sender, reward);
+            emit RewardPaid(msg.sender, reward);
+        }
+    }
+
+    /**
+     * @dev Exit: withdraw all tokens and claim rewards
+     */
+    function exit() external nonReentrant updateReward(msg.sender) {
+        // First withdraw all staked tokens
+        uint256 amount = balances[msg.sender];
+        if (amount > 0) {
+            // Calculate time-based fee
+            (uint256 totalFee, uint256 rewardPoolFee, uint256 devWalletFee) = calculateUnstakingFees(msg.sender, amount);
+            
+            // Amount after fee
+            uint256 withdrawAmount = amount.sub(totalFee);
+            
+            // Update state
+            totalStaked = totalStaked.sub(amount);
+            balances[msg.sender] = 0;
+            
+            // Calculate and log stake duration for analytics
+            uint256 stakeDuration = block.timestamp.sub(weightedStakeTime[msg.sender]);
+            
+            // Update fee statistics
+            totalFeesCollected = totalFeesCollected.add(totalFee);
+            
+            // Transfer tokens to user (after fee)
+            plsxToken.safeTransfer(msg.sender, withdrawAmount);
+            
+            // Transfer dev wallet portion
+            if (devWalletFee > 0) {
+                plsxToken.safeTransfer(DEV_WALLET, devWalletFee);
+            }
+            
+            // Log stake duration and fee tier applied
+            uint256 feePercentage = totalFee.mul(10000).div(amount);
+            emit StakeDurationFeeApplied(msg.sender, stakeDuration, feePercentage);
+            emit Withdrawn(msg.sender, withdrawAmount, totalFee);
+            emit FeeDistributed(totalFee, rewardPoolFee, devWalletFee);
+        }
+        
+        // Then claim any pending rewards
+        uint256 reward = rewards[msg.sender];
+        if (reward > 0) {
+            rewards[msg.sender] = 0;
+            totalRewardsDistributed = totalRewardsDistributed.add(reward);
+            plsxToken.safeTransfer(msg.sender, reward);
+            emit RewardPaid(msg.sender, reward);
+        }
+    }
+
+    /**
+     * @dev Set target sustainability period (owner only)
+     * @param _days New target period in days
+     */
+    function setTargetSustainabilityDays(uint256 _days) external onlyOwner {
+        require(_days >= 30 && _days <= 365, "Target days must be between 30-365");
+        targetSustainabilityDays = _days;
+        emit TargetSustainabilityUpdated(_days);
+    }
+
+    /**
+     * @dev Set minimum reward rate (owner only)
+     * @param _minRate New minimum reward rate
+     */
+    function setMinRewardRate(uint256 _minRate) external onlyOwner {
+        require(_minRate > 0, "Min rate must be greater than 0");
+        minRewardRate = _minRate;
+    }
+
+    /**
+     * @dev Set rate adjustment period (owner only)
+     * @param _period New period in seconds
+     */
+    function setRateAdjustmentPeriod(uint256 _period) external onlyOwner {
+        require(_period >= 1 days && _period <= 30 days, "Period must be 1-30 days");
+        rateAdjustmentPeriod = _period;
+    }
+
+    /**
+     * @dev Set maximum APR (owner only)
+     * @param _maxAPR New maximum APR in basis points
+     */
+    function setMaxAPR(uint256 _maxAPR) external onlyOwner {
+        require(_maxAPR >= 100 && _maxAPR <= 5000, "Max APR must be between 1-50%");
+        maxAPR = _maxAPR;
+    }
+
+    /**
+     * @dev Set minimum stake (owner only)
+     * @param _minimumStake New minimum stake amount
+     */
+    function setMinimumStake(uint256 _minimumStake) external onlyOwner {
+        minimumStake = _minimumStake;
+    }
+
+    /**
+     * @dev Force reward rate adjustment (owner only)
+     * @param _forceAdjust Whether to force adjustment even if period hasn't elapsed
+     */
+    function forceRewardRateAdjustment(bool _forceAdjust) external onlyOwner updateReward(address(0)) {
+        if (_forceAdjust) {
+            // Fixed code that ignores the first return value:
+            (, uint256 newRate) = checkRewardRateAdjustment();
+            
+            if (newRate != rewardRate) {
+                uint256 oldRate = rewardRate;
+                rewardRate = newRate;
+                lastRateAdjustmentTime = block.timestamp;
+                emit RewardRateAdjusted(oldRate, newRate, "Manual adjustment");
+            }
+        }
+    }
+
+    /**
+     * @dev Allows anyone to add rewards to the contract
+     * @param amount Amount to add to reward pool
+     */
+    function addRewards(uint256 amount) external {
+        require(amount > 0, "Cannot add 0 rewards");
+        plsxToken.safeTransferFrom(msg.sender, address(this), amount);
+    }
+
+    /**
+     * @dev Returns full staking statistics
+     * @return _totalStaked, _totalRewards, _apr, _daysRemaining
+     */
+    function getStakingStats() external view returns (uint256, uint256, uint256, uint256) {
+        return (
+            totalStaked,
+            getAvailableRewards(),
+            getCurrentAPR(),
+            getCurrentSustainabilityDays()
+        );
+    }
+
+    /**
+     * @dev Returns user stake information
+     * @param account User address
+     * @return _balance, _earned, _duration, _withdrawalFee
+     */
+    function getUserStakeInfo(address account) external view returns (uint256, uint256, uint256, uint256) {
+        uint256 stakeDuration = block.timestamp.sub(weightedStakeTime[account]);
+        
+        // Determine fee tier based on duration
+        uint256 feeTier;
+        if (stakeDuration < TIER_1_THRESHOLD) {
+            feeTier = FEE_TIER_1; // 5.0%
+        } else if (stakeDuration < TIER_2_THRESHOLD) {
+            feeTier = FEE_TIER_2; // 3.5%
+        } else if (stakeDuration < TIER_3_THRESHOLD) {
+            feeTier = FEE_TIER_3; // 2.0%
+        } else {
+            feeTier = FEE_TIER_4; // 1.0%
+        }
+        
+        return (
+            balances[account],
+            earned(account),
+            stakeDuration,
+            feeTier
+        );
+    }
+}
